@@ -129,7 +129,7 @@ impl Repository {
 
         let mut reader = PackfileReader::new(protocol)?;
 
-        reader.read_all_objects(&mut self.objects)?;
+        reader.read_all_objects(&mut *self.objects)?;
 
         // todo: read footer
 
@@ -142,7 +142,7 @@ impl Repository {
     pub fn import_packfile(&mut self, packfile: Vec<u8>, head: Option<Hash>) -> Result<()> {
         let mut reader = PackfileReader::from_file(packfile)?;
 
-        reader.read_all_objects(&mut self.objects)?;
+        reader.read_all_objects(&mut *self.objects)?;
 
         if let Some(head) = head {
             self.head = head;

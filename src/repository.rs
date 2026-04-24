@@ -5,14 +5,14 @@ use lmfu::LiteMap;
 
 use super::internals::{
     Result, Error, Mode, Directory, Path, TreeIter, Hash, CommitField, FileType,
-    ObjectStore, EntryType, Write, ObjectType, get_commit_field_hash,
+    StorageBackend, MemoryStorage, EntryType, Write, ObjectType, get_commit_field_hash, serialize_directory,
 };
 
-/// Local repository residing in memory
+/// Local repository residing in memory or other backend
 pub struct Repository {
     pub(crate) directories: RwLock<LiteMap<Hash, Directory>>,
-    pub(crate) objects: ObjectStore,
-    pub(crate) staged: ObjectStore,
+    pub(crate) objects: Box<dyn StorageBackend>,
+    pub(crate) staged: Box<dyn StorageBackend>,
     pub(crate) upstream_head: Hash,
     pub(crate) head: Hash,
     pub(crate) root: Option<Hash>,
@@ -23,15 +23,56 @@ impl Repository {
     pub fn new() -> Self {
         Self {
             directories: RwLock::new(LiteMap::new()),
-            objects: ObjectStore::new(),
-            staged: ObjectStore::new(),
+            objects: Box::new(MemoryStorage::new()),
+            staged: Box::new(MemoryStorage::new()),
             upstream_head: Hash::zero(),
             head: Hash::zero(),
             root: None,
         }
     }
 
-    pub (crate) fn any_store_get(&self, hash: Hash, obj_type: ObjectType) -> Option<&[u8]> {
+    /// Initializes a new repository on disk (Git compatible)
+    pub fn init_disk<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        use crate::storage::git_disk::GitDiskStorage;
+        let storage = GitDiskStorage::init_on_disk(path).map_err(|_| Error::PathError)?;
+        Ok(Self {
+            directories: RwLock::new(LiteMap::new()),
+            objects: Box::new(storage),
+            staged: Box::new(MemoryStorage::new()),
+            upstream_head: Hash::zero(),
+            head: Hash::zero(),
+            root: None,
+        })
+    }
+
+    /// Opens an existing repository on disk
+    pub fn open_disk<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        use crate::storage::git_disk::GitDiskStorage;
+        let storage = GitDiskStorage::new(path).map_err(|_| Error::PathError)?;
+        Ok(Self {
+            directories: RwLock::new(LiteMap::new()),
+            objects: Box::new(storage),
+            staged: Box::new(MemoryStorage::new()),
+            upstream_head: Hash::zero(),
+            head: Hash::zero(),
+            root: None,
+        })
+    }
+
+    /// Initializes a repository with KV Database storage
+    pub fn init_kv() -> Self {
+        use crate::storage::kv_db::KvDatabaseStorage;
+        Self {
+            directories: RwLock::new(LiteMap::new()),
+            objects: Box::new(KvDatabaseStorage::new()),
+            staged: Box::new(MemoryStorage::new()),
+            upstream_head: Hash::zero(),
+            head: Hash::zero(),
+            root: None,
+        }
+    }
+
+    pub (crate) fn any_store_get(&self, hash: Hash, obj_type: ObjectType) -> Option<Box<[u8]>> {
         match self.staged.get_as(hash, obj_type) {
             Some(entries) => Some(entries),
             None => self.objects.get_as(hash, obj_type),
@@ -40,10 +81,11 @@ impl Repository {
 
     /// None = MissingObject for this hash
     pub(crate) fn try_find_dir(&self, hash: Hash) -> Result<Option<Directory>> {
-        let mut iter = match self.any_store_get(hash, ObjectType::Tree) {
-            Some(entries) => TreeIter::new(entries),
+        let entries = match self.any_store_get(hash, ObjectType::Tree) {
+            Some(entries) => entries,
             None => return Ok(None),
         };
+        let mut iter = TreeIter::new(&entries);
 
         let mut dir = Directory::new();
 
@@ -88,12 +130,10 @@ impl Repository {
     }
 
     pub(crate) fn get_commit_root(&self, commit_hash: Hash) -> Result<Option<Hash>> {
-        match self.objects.get_as(commit_hash, ObjectType::Commit) {
-            Some(commit) => match get_commit_field_hash(commit, CommitField::Tree)? {
-                Some(hash) => Ok(Some(hash)),
-                None => Err(Error::InvalidObject),
-            },
-            None => Ok(None),
+        let commit = self.any_store_get(commit_hash, ObjectType::Commit).ok_or(Error::MissingObject)?;
+        match get_commit_field_hash(&commit, CommitField::Tree)? {
+            Some(hash) => Ok(Some(hash)),
+            None => Err(Error::InvalidObject),
         }
     }
 
@@ -144,7 +184,7 @@ impl Repository {
     /// Returns `PathError` if the path leads to nowhere.
     ///
     /// This can write-lock an internal RwLock for cache.
-    pub fn read_file(&self, path: &str) -> Result<&[u8]> {
+    pub fn read_file(&self, path: &str) -> Result<Box<[u8]>> {
         let path = Path::new(path);
         let mut current = self.root.ok_or(Error::PathError)?;
 
@@ -175,8 +215,9 @@ impl Repository {
     /// Returns `InvalidObject` if the file contains non-utf-8 bytes.
     ///
     /// This can write-lock an internal RwLock for cache.
-    pub fn read_text(&self, path: &str) -> Result<&str> {
-        match from_utf8(self.read_file(path)?) {
+    pub fn read_text(&self, path: &str) -> Result<String> {
+        let bytes = self.read_file(path)?;
+        match String::from_utf8(bytes.into_vec()) {
             Ok(string) => Ok(string),
             Err(_) => Err(Error::InvalidObject),
         }
@@ -214,7 +255,7 @@ impl Repository {
             };
 
             if let Some(subdir) = self.update_dir(subdir, steps, file_name, data)? {
-                let hash = self.staged.serialize_directory(&subdir, delta_hint);
+                let hash = serialize_directory(&mut *self.staged, &subdir, delta_hint);
                 self.directories.get_mut().unwrap().insert(hash, subdir);
                 result = Some((hash, Mode::Directory));
             }
@@ -263,7 +304,7 @@ impl Repository {
 
         if let Some(root_dir) = self.update_dir(root_dir, &mut subdirs, file_name, data)? {
             let prev_hash = self.root.and_then(|h| self.find_committed_hash_root(h));
-            let hash = self.staged.serialize_directory(&root_dir, prev_hash);
+            let hash = serialize_directory(&mut *self.staged, &root_dir, prev_hash);
             if self.objects.has(hash) {
                 self.staged.remove(hash);
             }
@@ -293,7 +334,7 @@ impl Repository {
                 self.directories.get_mut().unwrap().insert(hash, dir).unwrap();
             }
 
-            self.objects.insert_entry(dir_entry);
+            self.objects.insert(dir_entry.obj_type, dir_entry.content, Some(dir_entry.delta_hint));
         }
     }
 
@@ -362,7 +403,7 @@ impl Repository {
 
     /// Discard changes that weren't commited
     pub fn discard_changes(&mut self) {
-        self.staged = ObjectStore::new();
+        self.staged = Box::new(MemoryStorage::new());
         self.directories.get_mut().unwrap().clear();
         self.root = self.get_commit_root(self.head).unwrap();
     }

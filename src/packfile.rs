@@ -3,9 +3,9 @@ use lmfu::HashSet;
 use sha1::{Sha1, Digest};
 
 use super::internals::{
-    Result, Error, Write, ObjectStore, ObjectType, Hash,
+    Result, Error, Write, ObjectType, Hash,
     CommitField, GitProtocol, CommitParentsIter, TreeIter,
-    get_commit_field_hash,
+    get_commit_field_hash, StorageBackend,
 };
 
 use miniz_oxide::inflate::{core::{DecompressorOxide, decompress, inflate_flags}, TINFLStatus};
@@ -220,7 +220,7 @@ impl<'a> PackfileReader<'a> {
         }
     }
 
-    pub fn read_all_objects(&mut self, objects: &mut ObjectStore) -> Result<()> {
+    pub fn read_all_objects(&mut self, objects: &mut dyn StorageBackend) -> Result<()> {
         let mut pending_delta = Vec::new();
 
         for _ in 0..self.num_objects {
@@ -228,8 +228,8 @@ impl<'a> PackfileReader<'a> {
 
             if let PackfileObject::RefDelta(delta, hash) = object {
                 if let Some(src) = objects.get(hash) {
-                    let src_type = src.obj_type();
-                    let dst = reconstruct(&delta, src.content())?;
+                    let src_type = src.obj_type;
+                    let dst = reconstruct(&delta, &src.content)?;
                     let result_hash = objects.insert(src_type, dst, Some(hash));
                     log::trace!("Reconstructed {:>6} {}", src_type, result_hash);
                 } else {
@@ -253,8 +253,8 @@ impl<'a> PackfileReader<'a> {
             for i in 0..pending_delta.len() {
                 let (delta, hash) = &pending_delta[i];
                 if let Some(src) = objects.get(*hash) {
-                    let src_type = src.obj_type();
-                    let dst = reconstruct(&delta, src.content())?;
+                    let src_type = src.obj_type;
+                    let dst = reconstruct(&delta, &src.content)?;
                     let result_hash = objects.insert(src_type, dst, Some(*hash));
                     pending_delta.remove(i);
 
@@ -490,60 +490,58 @@ impl<'a> Write for PackfileSender<'a> {
     }
 }
 
-impl ObjectStore {
-    pub fn pack<W: Write>(&self, object: Hash, to_skip: &mut HashSet<Hash>, dst: &mut W) -> Result<usize> {
-        if to_skip.contains_key(&object) {
-            return Ok(0);
-        }
-
-        if !self.has(object) {
-            // this is ok for shallow clones
-            return Ok(0);
-        }
-
-        let mut count = 1;
-
-        let entry = self.get(object).ok_or(Error::MissingObject)?;
-        match entry.obj_type() {
-            ObjectType::Commit => {
-                let mut iter = CommitParentsIter::new(&entry.content());
-                while let Some(hash) = iter.next()? {
-                    count += self.pack(hash, to_skip, dst)?;
-                }
-
-                let tree = get_commit_field_hash(&entry.content(), CommitField::Tree)?;
-                count += self.pack(tree.ok_or(Error::InvalidObject)?, to_skip, dst)?;
-            },
-            ObjectType::Tree => {
-                let mut iter = TreeIter::new(&entry.content());
-                while let Some((_, hash, _)) = iter.next()? {
-                    count += self.pack(hash, to_skip, dst)?;
-                }
-            },
-            ObjectType::Blob => (),
-            ObjectType::Tag => (),
-        }
-
-        let raw_dump = true;
-        if let Some(other_object) = entry.delta_hint() {
-            if other_object != object {
-                // todo
-            } else {
-                log::warn!("object's delta_hint was itself");
-            }
-        }
-
-        if raw_dump {
-            dump_packfile_object(match entry.obj_type() {
-                ObjectType::Commit => PackfileObject::Commit(&entry.content()),
-                ObjectType::Tree => PackfileObject::Tree(&entry.content()),
-                ObjectType::Blob => PackfileObject::Blob(&entry.content()),
-                ObjectType::Tag => PackfileObject::Tag(&entry.content()),
-            }, dst);
-        }
-
-        to_skip.insert(object, ());
-
-        Ok(count)
+pub fn pack_object<W: Write>(storage: &dyn StorageBackend, object: Hash, to_skip: &mut HashSet<Hash>, dst: &mut W) -> Result<usize> {
+    if to_skip.contains_key(&object) {
+        return Ok(0);
     }
+
+    if !storage.has(object) {
+        // this is ok for shallow clones
+        return Ok(0);
+    }
+
+    let mut count = 1;
+
+    let entry = storage.get(object).ok_or(Error::MissingObject)?;
+    match entry.obj_type {
+        ObjectType::Commit => {
+            let mut iter = CommitParentsIter::new(&entry.content);
+            while let Some(hash) = iter.next()? {
+                count += pack_object(storage, hash, to_skip, dst)?;
+            }
+
+            let tree = get_commit_field_hash(&entry.content, CommitField::Tree)?;
+            count += pack_object(storage, tree.ok_or(Error::InvalidObject)?, to_skip, dst)?;
+        },
+        ObjectType::Tree => {
+            let mut iter = TreeIter::new(&entry.content);
+            while let Some((_, hash, _)) = iter.next()? {
+                count += pack_object(storage, hash, to_skip, dst)?;
+            }
+        },
+        ObjectType::Blob => (),
+        ObjectType::Tag => (),
+    }
+
+    let raw_dump = true;
+    if let Some(other_object) = entry.delta_hint() {
+        if other_object != object {
+            // todo
+        } else {
+            log::warn!("object's delta_hint was itself");
+        }
+    }
+
+    if raw_dump {
+        dump_packfile_object(match entry.obj_type {
+            ObjectType::Commit => PackfileObject::Commit(&entry.content),
+            ObjectType::Tree => PackfileObject::Tree(&entry.content),
+            ObjectType::Blob => PackfileObject::Blob(&entry.content),
+            ObjectType::Tag => PackfileObject::Tag(&entry.content),
+        }, dst);
+    }
+
+    to_skip.insert(object, ());
+
+    Ok(count)
 }

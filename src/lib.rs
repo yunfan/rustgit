@@ -11,6 +11,7 @@ mod protocol;
 mod packfile;
 mod clone;
 mod push;
+pub mod storage;
 
 pub use {
     repository::Repository, directory::{Mode, EntryType, FileType},
@@ -24,9 +25,10 @@ pub mod internals {
         EntryType, FileType, Mode, Hash,
     };
     pub use {
+        super::storage::{StorageBackend, memory::MemoryStorage},
         super::objectstore::{
-            ObjectStore, Object, ObjectType, TreeIter, CommitParentsIter,
-            CommitField, get_commit_field, get_commit_field_hash,
+            Object, ObjectType, TreeIter, CommitParentsIter,
+            CommitField, get_commit_field, get_commit_field_hash, serialize_directory,
         },
         super::directory::{Directory, Path},
         super::protocol::{PacketLine, GitProtocol},

@@ -66,7 +66,8 @@ impl Repository {
                         }
 
                         if thin_pack {
-                            self.objects.pack(commit_hash, &mut to_skip, &mut _bytes)?;
+                            use crate::packfile::pack_object;
+                            pack_object(&*self.objects, commit_hash, &mut to_skip, &mut _bytes)?;
                         }
                     } else {
                         return Err(Error::MustForcePush);
@@ -139,7 +140,8 @@ impl Repository {
             let mut bytes = ByteCounter(0);
 
             for (_, commit_hash) in heads_to_include {
-                count += self.objects.pack(*commit_hash, &mut to_skip, &mut bytes)?;
+                use crate::packfile::pack_object;
+                pack_object(&*self.objects, *commit_hash, &mut to_skip, &mut bytes)?;
             }
 
             log::info!("Packfile: {} objects, {} bytes", count, bytes.0);
@@ -149,7 +151,8 @@ impl Repository {
         size_hint(dst, crate::packfile::HEADER_SZ + bytes);
         dump_packfile_header(num_objects, dst);
         for (_, commit_hash) in heads_to_include {
-            self.objects.pack(*commit_hash, &mut to_skip, dst)?;
+            use crate::packfile::pack_object;
+            pack_object(&*self.objects, *commit_hash, &mut to_skip, dst)?;
         }
 
         Ok(())

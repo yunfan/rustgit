@@ -103,10 +103,11 @@ impl fmt::Display for ObjectType {
     }
 }
 
+#[derive(Clone)]
 pub struct Object {
-    obj_type: ObjectType,
-    content: Box<[u8]>,
-    delta_hint: Hash,
+    pub obj_type: ObjectType,
+    pub content: Box<[u8]>,
+    pub delta_hint: Hash,
 }
 
 impl Object {
@@ -126,79 +127,21 @@ impl Object {
     }
 }
 
-pub struct ObjectStore([LiteMap<Hash, Object>; 256]);
+use crate::storage::StorageBackend;
 
-impl ObjectStore {
-    pub fn new() -> Self {
-        Self(from_fn(|_| LiteMap::new()))
-    }
+pub fn serialize_directory(storage: &mut dyn StorageBackend, dir: &Directory, delta_hint: Option<Hash>) -> Hash {
+    let mut serialized = Vec::new();
 
-    pub fn serialize_directory(&mut self, dir: &Directory, delta_hint: Option<Hash>) -> Hash {
-        let mut serialized = Vec::new();
+    for (node, (hash, mode)) in dir.iter() {
+        let mode = *mode as u32;
+        write!(&mut serialized, "{:o} {}\0", mode, node).unwrap();
 
-        for (node, (hash, mode)) in dir.iter() {
-            let mode = *mode as u32;
-            write!(&mut serialized, "{:o} {}\0", mode, node).unwrap();
-
-            for byte in hash.to_bytes() {
-                serialized.push(byte);
-            }
-        }
-
-        self.insert(ObjectType::Tree, serialized.into_boxed_slice(), delta_hint)
-    }
-
-    pub fn hash(&self, obj_type: ObjectType, content: &[u8]) -> Hash {
-        let mut hasher = Sha1::new();
-        write!(&mut hasher, "{} {}\0", obj_type, content.len()).unwrap();
-        hasher.update(content);
-        Hash::new(hasher.finalize().into())
-    }
-
-    pub fn insert_entry(&mut self, entry: Object) -> Hash {
-        let hash = self.hash(entry.obj_type, &entry.content);
-        self.0[hash.first_byte()].insert(hash, entry);
-        hash
-    }
-
-    pub fn insert(
-        &mut self,
-        obj_type: ObjectType,
-        content: Box<[u8]>,
-        delta_hint: Option<Hash>,
-    ) -> Hash {
-        let delta_hint = delta_hint.unwrap_or(Hash::zero());
-        self.insert_entry(Object {
-            obj_type,
-            content,
-            delta_hint,
-        })
-    }
-
-    pub fn get(&self, object: Hash) -> Option<&Object> {
-        self.0[object.first_byte()].get(&object)
-    }
-
-    pub fn has(&self, object: Hash) -> bool {
-        self.0[object.first_byte()].contains_key(&object)
-    }
-
-    pub fn get_as(&self, object: Hash, obj_type: ObjectType) -> Option<&[u8]> {
-        match self.get(object) {
-            Some(entry) => match entry.obj_type == obj_type {
-                true => Some(&entry.content),
-                false => {
-                    log::warn!("Object {} was expected to be a {:?} but it's actually a {:?}", object, obj_type, entry.obj_type);
-                    None
-                },
-            },
-            None => None,
+        for byte in hash.to_bytes() {
+            serialized.push(byte);
         }
     }
 
-    pub fn remove(&mut self, object: Hash) -> Option<Object> {
-        self.0[object.first_byte()].remove(&object)
-    }
+    storage.insert(ObjectType::Tree, serialized.into_boxed_slice(), delta_hint)
 }
 
 pub struct TreeIter<'a> {
