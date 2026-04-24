@@ -1,6 +1,9 @@
 pub mod memory;
 pub mod git_disk;
 pub mod kv_db;
+pub mod state;
+
+pub use self::state::StateStore;
 
 use super::internals::{Hash, Object, ObjectType};
 

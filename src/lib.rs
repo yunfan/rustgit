@@ -1,4 +1,5 @@
 #![doc = include_str!("../README.md")]
+#![deny(unused_imports)]
 
 use std::{net::TcpStream, io::Write};
 use lmfu::{json::{JsonFile, Path as JsonPath}, ArcStr};
@@ -25,7 +26,7 @@ pub mod internals {
         EntryType, FileType, Mode, Hash,
     };
     pub use {
-        super::storage::{StorageBackend, memory::MemoryStorage},
+        super::storage::{StorageBackend, StateStore, memory::MemoryStorage},
         super::objectstore::{
             Object, ObjectType, TreeIter, CommitParentsIter,
             CommitField, get_commit_field, get_commit_field_hash, serialize_directory,

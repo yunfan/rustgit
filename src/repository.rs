@@ -4,14 +4,15 @@ use std::sync::RwLock;
 use lmfu::LiteMap;
 
 use super::internals::{
-    Result, Error, Mode, Directory, Path, TreeIter, Hash, CommitField, FileType,
-    StorageBackend, MemoryStorage, EntryType, Write, ObjectType, get_commit_field_hash, serialize_directory,
+    Error, Hash, ObjectType, Result, StorageBackend, StateStore,
+    CommitField, get_commit_field_hash, serialize_directory, Directory, Path, TreeIter, FileType, EntryType, Write, Mode,
 };
 
 /// Local repository residing in memory or other backend
 pub struct Repository {
     pub(crate) directories: RwLock<LiteMap<Hash, Directory>>,
     pub(crate) objects: Box<dyn StorageBackend>,
+    pub(crate) states: Box<dyn StateStore>,
     pub(crate) staged: Box<dyn StorageBackend>,
     pub(crate) upstream_head: Hash,
     pub(crate) head: Hash,
@@ -23,8 +24,9 @@ impl Repository {
     pub fn new() -> Self {
         Self {
             directories: RwLock::new(LiteMap::new()),
-            objects: Box::new(MemoryStorage::new()),
-            staged: Box::new(MemoryStorage::new()),
+            objects: Box::new(crate::storage::memory::MemoryStorage::new()),
+            states: Box::new(crate::storage::memory::MemoryStateStore::new()),
+            staged: Box::new(crate::storage::memory::MemoryStorage::new()),
             upstream_head: Hash::zero(),
             head: Hash::zero(),
             root: None,
@@ -33,12 +35,14 @@ impl Repository {
 
     /// Initializes a new repository on disk (Git compatible)
     pub fn init_disk<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        use crate::storage::git_disk::GitDiskStorage;
-        let storage = GitDiskStorage::init_on_disk(path).map_err(|_| Error::PathError)?;
+        use crate::storage::git_disk::{GitDiskStorage, GitDiskStateStore};
+        let storage = GitDiskStorage::init_on_disk(&path).map_err(|_| Error::PathError)?;
+        let states = GitDiskStateStore::new(&path);
         Ok(Self {
             directories: RwLock::new(LiteMap::new()),
             objects: Box::new(storage),
-            staged: Box::new(MemoryStorage::new()),
+            states: Box::new(states),
+            staged: Box::new(crate::storage::memory::MemoryStorage::new()),
             upstream_head: Hash::zero(),
             head: Hash::zero(),
             root: None,
@@ -47,25 +51,51 @@ impl Repository {
 
     /// Opens an existing repository on disk
     pub fn open_disk<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        use crate::storage::git_disk::GitDiskStorage;
-        let storage = GitDiskStorage::new(path).map_err(|_| Error::PathError)?;
+        use crate::storage::git_disk::{GitDiskStorage, GitDiskStateStore};
+        let storage = GitDiskStorage::new(&path).map_err(|_| Error::PathError)?;
+        let states = GitDiskStateStore::new(&path);
         Ok(Self {
             directories: RwLock::new(LiteMap::new()),
             objects: Box::new(storage),
-            staged: Box::new(MemoryStorage::new()),
+            states: Box::new(states),
+            staged: Box::new(crate::storage::memory::MemoryStorage::new()),
             upstream_head: Hash::zero(),
             head: Hash::zero(),
             root: None,
         })
     }
 
+    /// Sets the current HEAD hash manually (useful for CLI state restoration)
+    pub fn set_head(&mut self, hash: Hash) {
+        self.head = hash;
+    }
+
+    pub fn read_ref(&self, name: &str) -> Option<Hash> { self.states.read_ref(name) }
+    pub fn write_ref(&mut self, name: &str, hash: Hash) -> Result<()> { self.states.write_ref(name, hash).map_err(|_| Error::PathError) }
+    pub fn delete_ref(&mut self, name: &str) -> Result<()> { self.states.delete_ref(name).map_err(|_| Error::PathError) }
+    pub fn list_refs(&self, prefix: &str) -> Result<Vec<(String, Hash)>> { self.states.list_refs(prefix).map_err(|_| Error::PathError) }
+    pub fn read_head_str(&self) -> Option<String> { self.states.read_head() }
+    pub fn write_head_str(&mut self, target: &str) -> Result<()> { self.states.write_head(target).map_err(|_| Error::PathError) }
+    pub fn read_index(&self) -> Option<String> { self.states.read_index() }
+    pub fn write_index(&mut self, data: &str) -> Result<()> { self.states.write_index(data).map_err(|_| Error::PathError) }
+    pub fn clear_index(&mut self) -> Result<()> { self.states.clear_index().map_err(|_| Error::PathError) }
+
+    /// Gets an object from the repository's active storage backend
+    pub fn get_object(&self, hash: Hash, obj_type: ObjectType) -> Option<Box<[u8]>> {
+        self.any_store_get(hash, obj_type)
+    }
+
     /// Initializes a repository with KV Database storage
     pub fn init_kv() -> Self {
-        use crate::storage::kv_db::KvDatabaseStorage;
+        use crate::storage::kv_db::{KvDatabaseStorage, KvStateStore};
+        let db = sled::open(".rustgit_kv").unwrap();
+        let storage = KvDatabaseStorage::new(db.clone());
+        let states = KvStateStore::new(db);
         Self {
             directories: RwLock::new(LiteMap::new()),
-            objects: Box::new(KvDatabaseStorage::new()),
-            staged: Box::new(MemoryStorage::new()),
+            objects: Box::new(storage),
+            states: Box::new(states),
+            staged: Box::new(crate::storage::memory::MemoryStorage::new()),
             upstream_head: Hash::zero(),
             head: Hash::zero(),
             root: None,
@@ -374,7 +404,13 @@ impl Repository {
         let mut serialized = Vec::new();
 
         if let Some(root) = self.root {
-            if Some(root) != self.get_commit_root(self.head).unwrap() {
+            let head_root = if self.head.is_zero() {
+                None
+            } else {
+                self.get_commit_root(self.head).unwrap_or(None)
+            };
+            
+            if Some(root) != head_root {
                 self.commit_object(root);
             }
         }
@@ -395,6 +431,33 @@ impl Repository {
         Ok(self.head)
     }
 
+    /// Creates an annotated tag object and inserts it into the object store.
+    pub fn create_annotated_tag(
+        &mut self,
+        target_commit: Hash,
+        name: &str,
+        message: &str,
+        tagger: (&str, &str),
+        timestamp: Option<u64>,
+    ) -> Result<Hash> {
+        let timestamp = timestamp.unwrap_or_else(|| {
+            let now = SystemTime::now();
+            match now.duration_since(UNIX_EPOCH) {
+                Ok(duration) => duration.as_secs(),
+                _ => 0,
+            }
+        });
+
+        let mut serialized = Vec::new();
+        write!(&mut serialized, "object {}\n", target_commit).unwrap();
+        write!(&mut serialized, "type commit\n").unwrap();
+        write!(&mut serialized, "tag {}\n", name).unwrap();
+        write!(&mut serialized, "tagger {} <{}> {} +0000\n", tagger.0, tagger.1, timestamp).unwrap();
+        write!(&mut serialized, "\n{}\n", message).unwrap();
+
+        Ok(self.objects.insert(ObjectType::Tag, serialized.into(), None))
+    }
+
     /// Resets the current commit to the branch head in upstream
     ///
     /// Changes from the discarded commits are still present (staged).
@@ -404,7 +467,7 @@ impl Repository {
 
     /// Discard changes that weren't commited
     pub fn discard_changes(&mut self) {
-        self.staged = Box::new(MemoryStorage::new());
+        self.staged = Box::new(crate::storage::memory::MemoryStorage::new());
         self.directories.get_mut().unwrap().clear();
         self.root = self.get_commit_root(self.head).unwrap();
     }
