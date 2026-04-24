@@ -141,7 +141,7 @@ impl Repository {
 
             for (_, commit_hash) in heads_to_include {
                 use crate::packfile::pack_object;
-                pack_object(&*self.objects, *commit_hash, &mut to_skip, &mut bytes)?;
+                count += pack_object(&*self.objects, *commit_hash, &mut to_skip, &mut bytes)?;
             }
 
             log::info!("Packfile: {} objects, {} bytes", count, bytes.0);

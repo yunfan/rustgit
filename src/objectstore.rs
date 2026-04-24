@@ -1,6 +1,4 @@
 use core::{fmt, array::from_fn, str::from_utf8};
-use lmfu::LiteMap;
-use sha1::{Sha1, Digest};
 
 use super::internals::{Result, Error, Directory, Write, Mode};
 
@@ -55,9 +53,7 @@ impl Hash {
         }
     }
 
-    fn first_byte(&self) -> usize {
-        self.0[0].to_ne_bytes()[0] as _
-    }
+
 
     pub fn to_bytes(&self) -> [u8; 20] {
         let mut array = [0; 20];

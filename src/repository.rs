@@ -1,4 +1,4 @@
-use core::str::from_utf8;
+
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::RwLock;
 use lmfu::LiteMap;
@@ -326,6 +326,7 @@ impl Repository {
                 // this unwrap is questionable
                 let dir = self.directories.get_mut().unwrap().insert(hash, Directory::new()).unwrap();
 
+                #[allow(deprecated)]
                 for (hash, _mode) in dir.iter_values() {
                     self.commit_object(*hash);
                 }
