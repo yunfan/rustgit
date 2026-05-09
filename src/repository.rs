@@ -77,7 +77,136 @@ impl Repository {
     pub fn read_head_str(&self) -> Option<String> { self.states.read_head() }
     pub fn write_head_str(&mut self, target: &str) -> Result<()> { self.states.write_head(target).map_err(|_| Error::PathError) }
     pub fn read_index(&self) -> Option<String> { self.states.read_index() }
-    pub fn write_index(&mut self, data: &str) -> Result<()> { self.states.write_index(data).map_err(|_| Error::PathError) }
+    
+    pub fn load_index(&mut self) -> Result<()> {
+        if let Some(entries) = self.states.read_index_entries() {
+            for (path, hash, _size) in entries {
+                let _ = self.stage_hash(&path, Some((hash, crate::Mode::RegularFile)));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn update_dir_hash<'a, I: Iterator<Item = &'a str>>(
+        &mut self,
+        mut directory: crate::internals::Directory,
+        steps: &mut I,
+        file_name: &str,
+        data: Option<(Hash, crate::Mode)>,
+    ) -> Result<Option<crate::internals::Directory>> {
+        let mut result = None;
+        let step = steps.next();
+        let node = step.unwrap_or(file_name);
+        let prev_hash = directory.get(node).map(|(hash, _mode)| *hash);
+        let delta_hint = prev_hash.and_then(|hash| self.find_committed_hash_root(hash));
+
+        if step.is_some() {
+            let subdir = match prev_hash {
+                Some(hash) => self.remove_dir(hash)?,
+                None => crate::internals::Directory::new(),
+            };
+            if let Some(subdir) = self.update_dir_hash(subdir, steps, file_name, data)? {
+                let hash = crate::internals::serialize_directory(&mut *self.staged, &subdir, delta_hint);
+                self.directories.get_mut().unwrap().insert(hash, subdir);
+                result = Some((hash, crate::Mode::Directory));
+            }
+        } else {
+            result = data;
+        }
+
+        Ok(if let Some((hash, mode)) = result {
+            if self.objects.has(hash) {
+                self.staged.remove(hash);
+            }
+            directory.insert(node.into(), (hash, mode));
+            Some(directory)
+        } else {
+            directory.remove(node);
+            match directory.is_empty() {
+                true => None,
+                false => Some(directory),
+            }
+        })
+    }
+
+    pub fn stage_hash(&mut self, path: &str, data: Option<(Hash, crate::Mode)>) -> Result<()> {
+        let path = crate::internals::Path::new(path);
+        let root_dir = match self.root {
+            Some(hash) => self.remove_dir(hash)?,
+            None => crate::internals::Directory::new(),
+        };
+        let file_name = path.file()?;
+        let mut subdirs = path.dirs()?;
+
+        if let Some(root_dir) = self.update_dir_hash(root_dir, &mut subdirs, file_name, data)? {
+            let prev_hash = self.root.and_then(|h| self.find_committed_hash_root(h));
+            let hash = crate::internals::serialize_directory(&mut *self.staged, &root_dir, prev_hash);
+            if self.objects.has(hash) {
+                self.staged.remove(hash);
+            }
+            self.directories.get_mut().unwrap().insert(hash, root_dir);
+            self.root = Some(hash);
+        } else {
+            self.root = None;
+        }
+        Ok(())
+    }
+    pub fn sync_index(&mut self) -> Result<()> {
+        let mut entries = Vec::new();
+        self.collect_index_entries("", &mut entries)?;
+        self.states.write_index(&entries).map_err(|_| Error::PathError)
+    }
+
+    /// Flushes all in-memory staged objects directly to the primary object store
+    /// This is necessary because CLI processes exit and memory is lost.
+    pub fn flush_staged(&mut self) -> Result<()> {
+        // Since we can't easily iterate the trait, we just commit from root!
+        // Wait, staged is an ObjectStore, it doesn't expose iter().
+        // But we only need to persist the objects referenced by self.root.
+        if let Some(root) = self.root {
+            self.commit_object(root);
+        }
+        Ok(())
+    }
+
+    fn collect_index_entries(&self, current_path: &str, collected: &mut Vec<(String, Hash, u32)>) -> Result<()> {
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+
+        let _ = self.for_each_entry(current_path, crate::EntryType::All, |name, mode, hash| {
+            let full_path = if current_path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{}", current_path, name)
+            };
+            match mode {
+                crate::Mode::Directory => dirs.push(full_path),
+                _ => files.push((full_path, hash)),
+            }
+        });
+
+        for (file_path, hash) in files {
+            if file_path.starts_with(".git/") || file_path == ".git" {
+                continue;
+            }
+            let size = if let Some(blob) = self.get_object(hash, crate::internals::ObjectType::Blob) {
+                blob.len() as u32
+            } else {
+                0
+            };
+            collected.push((file_path, hash, size));
+        }
+
+        for dir_path in dirs {
+            if dir_path.starts_with(".git/") || dir_path == ".git" {
+                continue;
+            }
+            let _ = self.collect_index_entries(&dir_path, collected);
+        }
+
+        Ok(())
+    }
+
     pub fn clear_index(&mut self) -> Result<()> { self.states.clear_index().map_err(|_| Error::PathError) }
 
     /// Gets an object from the repository's active storage backend
@@ -348,6 +477,70 @@ impl Repository {
         Ok(())
     }
 
+    pub fn commit_stash(&mut self, message: &str) -> Result<()> {
+        let head_hash = if self.head.is_zero() { return Err(Error::MissingObject) } else { self.head };
+        let head_tree = self.get_commit_root(head_hash).unwrap_or(None).unwrap_or(Hash::zero());
+
+        // 1. Create Index Commit (parent: HEAD, tree: current index state)
+        let index_root = {
+            let mut entries = Vec::new();
+            self.collect_index_entries("", &mut entries)?;
+            let mut dir = crate::internals::Directory::new();
+            let mut staged_store = crate::storage::memory::MemoryStorage::new();
+            for (path, hash, _size) in entries {
+                let mut path_dirs = crate::internals::Path::new(&path).dirs().unwrap();
+                let file_name = crate::internals::Path::new(&path).file().unwrap();
+                let _ = crate::internals::update_dir_hash(&mut staged_store, &mut dir, &mut path_dirs, file_name, Some((hash, crate::Mode::RegularFile)));
+            }
+            crate::internals::serialize_directory(&mut staged_store, &dir, None)
+        };
+
+        // For simplicity in our lightweight implementation, we'll just use the same tree for index and worktree
+        // since `rgit stash` currently builds the working tree root into `self.root`.
+        let worktree_root = self.root.ok_or(Error::PathError)?;
+        self.commit_object(worktree_root);
+
+        let now = std::time::SystemTime::now();
+        let timestamp = now.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let author = format!("rustgit-stash <rustgit@localhost> {} +0000", timestamp);
+
+        let mut index_commit_bytes = Vec::new();
+        use std::io::Write;
+        write!(&mut index_commit_bytes, "tree {}\nparent {}\nauthor {}\ncommitter {}\n\nindex on HEAD\n", index_root, head_hash, author, author).unwrap();
+        let index_commit_hash = self.staged.insert(ObjectType::Commit, index_commit_bytes.into_boxed_slice(), None);
+        self.commit_object(index_commit_hash);
+
+        // 2. Create Stash Commit (parents: HEAD and Index Commit, tree: working tree)
+        let mut stash_commit_bytes = Vec::new();
+        write!(&mut stash_commit_bytes, "tree {}\nparent {}\nparent {}\nauthor {}\ncommitter {}\n\n{}\n", worktree_root, head_hash, index_commit_hash, author, author, message).unwrap();
+        let stash_commit_hash = self.staged.insert(ObjectType::Commit, stash_commit_bytes.into_boxed_slice(), None);
+        self.commit_object(stash_commit_hash);
+
+        // 3. Write to Reflog
+        let old_stash = self.read_ref("refs/stash").unwrap_or(Hash::zero());
+        self.append_reflog("refs/stash", old_stash, stash_commit_hash, "rustgit-stash <rustgit@localhost>", message)?;
+
+        self.write_ref("refs/stash", stash_commit_hash)?;
+        Ok(())
+    }
+
+    pub fn pop_stash(&mut self) -> Result<Hash> {
+        let stash_hash = self.read_ref("refs/stash").ok_or(Error::MissingObject)?;
+        
+        let parent_hash = match self.states.pop_reflog("refs/stash") {
+            Ok(Some(hash)) => hash,
+            _ => Hash::zero(),
+        };
+
+        if parent_hash.is_zero() {
+            let _ = self.delete_ref("refs/stash");
+        } else {
+            self.write_ref("refs/stash", parent_hash)?;
+        }
+        
+        Ok(stash_hash)
+    }
+
     pub(crate) fn commit_object(&mut self, hash: Hash) {
         if let Some(dir_entry) = self.staged.remove(hash) {
             if dir_entry.obj_type() == ObjectType::Tree {
@@ -413,6 +606,12 @@ impl Repository {
             if Some(root) != head_root {
                 self.commit_object(root);
             }
+        } else {
+            // Create an empty tree if root is None
+            let empty_dir = crate::internals::Directory::new();
+            let hash = crate::internals::serialize_directory(&mut *self.staged, &empty_dir, None);
+            self.directories.write().unwrap().insert(hash, empty_dir);
+            self.root = Some(hash);
         }
 
         let root = self.root.unwrap_or(Hash::zero());

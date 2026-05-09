@@ -67,7 +67,7 @@ use std::io;
 pub struct MemoryStateStore {
     refs: Arc<RwLock<std::collections::HashMap<String, Hash>>>,
     head: Arc<RwLock<Option<String>>>,
-    index: Arc<RwLock<Option<String>>>,
+    index: Arc<RwLock<Option<Vec<(String, Hash, u32)>>>>,
 }
 
 impl MemoryStateStore {
@@ -112,11 +112,20 @@ impl super::StateStore for MemoryStateStore {
     }
 
     fn read_index(&self) -> Option<String> {
+        if let Some(entries) = self.index.read().unwrap().as_ref() {
+            let lines: Vec<String> = entries.iter().map(|(p, _, _)| p.clone()).collect();
+            if lines.is_empty() { None } else { Some(lines.join("\n")) }
+        } else {
+            None
+        }
+    }
+
+    fn read_index_entries(&self) -> Option<Vec<(String, crate::internals::Hash, u32)>> {
         self.index.read().unwrap().clone()
     }
 
-    fn write_index(&mut self, data: &str) -> io::Result<()> {
-        *self.index.write().unwrap() = Some(data.to_string());
+    fn write_index(&mut self, entries: &[(String, crate::internals::Hash, u32)]) -> io::Result<()> {
+        *self.index.write().unwrap() = Some(entries.to_vec());
         Ok(())
     }
 

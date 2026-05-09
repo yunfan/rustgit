@@ -21,12 +21,21 @@ pub trait StateStore: Send + Sync {
     /// Write the HEAD pointer
     fn write_head(&mut self, target: &str) -> Result<()>;
     
-    /// Read the staging index
+    /// Read the staging index paths (legacy)
     fn read_index(&self) -> Option<String>;
     
+    /// Read the staging index entries (paths, hashes, sizes)
+    fn read_index_entries(&self) -> Option<Vec<(String, crate::internals::Hash, u32)>>;
+    
     /// Write the staging index
-    fn write_index(&mut self, data: &str) -> Result<()>;
+    fn write_index(&mut self, entries: &[(String, crate::internals::Hash, u32)]) -> Result<()>;
     
     /// Clear the staging index
     fn clear_index(&mut self) -> Result<()>;
+
+    /// Append to a reflog
+    fn append_reflog(&mut self, name: &str, old_hash: Hash, new_hash: Hash, committer: &str, message: &str) -> Result<()> { Ok(()) }
+    
+    /// Pop the last entry from a reflog and return its old_hash (parent)
+    fn pop_reflog(&mut self, name: &str) -> Result<Option<Hash>> { Ok(None) }
 }

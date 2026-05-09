@@ -176,21 +176,48 @@ impl super::StateStore for KvStateStore {
     }
 
     fn read_index(&self) -> Option<String> {
-        if let Ok(Some(value)) = self.db.get(b"INDEX") {
-            std::str::from_utf8(&value).map(|s| s.to_string()).ok()
+        if let Some(entries) = self.read_index_entries() {
+            let lines: Vec<String> = entries.iter().map(|(p, _, _)| p.clone()).collect();
+            if lines.is_empty() { None } else { Some(lines.join("\n")) }
         } else {
             None
         }
     }
 
-    fn write_index(&mut self, data: &str) -> std::io::Result<()> {
-        let _ = self.db.insert(b"INDEX", data.as_bytes());
+    fn read_index_entries(&self) -> Option<Vec<(String, crate::internals::Hash, u32)>> {
+        if let Ok(Some(value)) = self.db.get(b"INDEX_ENTRIES") {
+            if let Ok(s) = std::str::from_utf8(&value) {
+                let mut entries = Vec::new();
+                for line in s.lines() {
+                    let parts: Vec<&str> = line.splitn(3, ' ').collect();
+                    if parts.len() == 3 {
+                        if let Some(hash) = Hash::from_hex(parts[0]) {
+                            if let Ok(size) = parts[1].parse::<u32>() {
+                                entries.push((parts[2].to_string(), hash, size));
+                            }
+                        }
+                    }
+                }
+                if entries.is_empty() { return None; }
+                return Some(entries);
+            }
+        }
+        None
+    }
+
+    fn write_index(&mut self, entries: &[(String, crate::internals::Hash, u32)]) -> std::io::Result<()> {
+        let mut lines = Vec::new();
+        for (path, hash, size) in entries {
+            lines.push(format!("{} {} {}", hash, size, path));
+        }
+        let data = lines.join("\n");
+        let _ = self.db.insert(b"INDEX_ENTRIES", data.as_bytes());
         let _ = self.db.flush();
         Ok(())
     }
 
     fn clear_index(&mut self) -> std::io::Result<()> {
-        let _ = self.db.remove(b"INDEX");
+        let _ = self.db.remove(b"INDEX_ENTRIES");
         let _ = self.db.flush();
         Ok(())
     }

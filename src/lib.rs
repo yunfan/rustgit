@@ -13,6 +13,8 @@ mod packfile;
 mod clone;
 mod push;
 pub mod storage;
+pub mod ignore;
+pub mod diff;
 
 pub use {
     repository::Repository, directory::{Mode, EntryType, FileType},

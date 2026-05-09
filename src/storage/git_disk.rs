@@ -250,61 +250,103 @@ impl super::StateStore for GitDiskStateStore {
         }
     }
 
-    fn write_index(&mut self, data: &str) -> io::Result<()> {
-        // Write binary standard .git/index to perfectly sync with native Git
-        // Even if we use fake zeroes for stat metadata, native Git will recognize it
-        use sha1::{Sha1, Digest};
-        let mut index = Vec::new();
-        index.extend_from_slice(b"DIRC");
-        index.extend_from_slice(&2u32.to_be_bytes());
+    fn read_index_entries(&self) -> Option<Vec<(String, crate::internals::Hash, u32)>> {
+        let mut entries = Vec::new();
 
-        let mut lines: Vec<&str> = data.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
-        lines.sort();
-        index.extend_from_slice(&(lines.len() as u32).to_be_bytes());
+        // Read standard git binary index (dircache V2/V3)
+        let git_index_path = self.repo_path.join(".git").join("index");
+        if let Ok(data) = fs::read(git_index_path) {
+            if data.len() >= 12 && &data[0..4] == b"DIRC" {
+                if let Ok(version) = data[4..8].try_into().map(u32::from_be_bytes) {
+                    if version == 2 || version == 3 {
+                        if let Ok(count) = data[8..12].try_into().map(u32::from_be_bytes) {
+                            let mut offset = 12;
+                            for _ in 0..count {
+                                if offset + 62 > data.len() { break; }
+                                let size = u32::from_be_bytes(data[offset+36..offset+40].try_into().unwrap());
+                                let hash_bytes: [u8; 20] = data[offset+40..offset+60].try_into().unwrap();
+                                let hash = crate::internals::Hash::new(hash_bytes);
 
-        for line in lines {
-            let file_path = self.repo_path.join(line);
-            if let Ok(content) = fs::read(&file_path) {
-                let mut entry = Vec::new();
-                entry.extend_from_slice(&0u32.to_be_bytes()); // ctime.sec
-                entry.extend_from_slice(&0u32.to_be_bytes()); // ctime.nsec
-                entry.extend_from_slice(&0u32.to_be_bytes()); // mtime.sec
-                entry.extend_from_slice(&0u32.to_be_bytes()); // mtime.nsec
-                entry.extend_from_slice(&0u32.to_be_bytes()); // dev
-                entry.extend_from_slice(&0u32.to_be_bytes()); // ino
-                entry.extend_from_slice(&0x81A4u32.to_be_bytes()); // mode 100644
-                entry.extend_from_slice(&0u32.to_be_bytes()); // uid
-                entry.extend_from_slice(&0u32.to_be_bytes()); // gid
-                entry.extend_from_slice(&(content.len() as u32).to_be_bytes()); // size
-
-                let mut hasher = Sha1::new();
-                hasher.update(format!("blob {}\0", content.len()).as_bytes());
-                hasher.update(&content);
-                let hash = hasher.finalize();
-                entry.extend_from_slice(&hash);
-
-                let flags = (line.len() as u16) & 0xFFF;
-                entry.extend_from_slice(&flags.to_be_bytes());
-                entry.extend_from_slice(line.as_bytes());
-
-                let total_len = 62 + line.len();
-                let pad = 8 - (total_len % 8);
-                for _ in 0..pad {
-                    entry.push(0);
+                                if let Ok(flags) = data[offset+60..offset+62].try_into().map(u16::from_be_bytes) {
+                                    let name_len = (flags & 0xFFF) as usize;
+                                    offset += 62;
+                                    let name_end = offset + name_len;
+                                    if name_end > data.len() { break; }
+                                    
+                                    if let Ok(name) = std::str::from_utf8(&data[offset..name_end]) {
+                                        entries.push((name.to_string(), hash, size));
+                                    }
+                                    
+                                    let total_len = 62 + name_len;
+                                    let pad = 8 - (total_len % 8);
+                                    offset += name_len + pad;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
-                index.extend_from_slice(&entry);
             }
         }
 
+        if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        }
+    }
+
+    fn write_index(&mut self, entries: &[(String, crate::internals::Hash, u32)]) -> io::Result<()> {
+        // Write binary standard .git/index to perfectly sync with native Git
+        // We use the provided hashes and sizes to build the index without reading from disk.
+        let mut index = Vec::new();
+        index.extend_from_slice(b"DIRC");
+        index.extend_from_slice(&2u32.to_be_bytes());
+        index.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+
+        // Standard index must be sorted by path
+        let mut sorted_entries = entries.to_vec();
+        sorted_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (line, hash, size) in sorted_entries {
+            let mut entry = Vec::new();
+            entry.extend_from_slice(&0u32.to_be_bytes()); // ctime.sec
+            entry.extend_from_slice(&0u32.to_be_bytes()); // ctime.nsec
+            entry.extend_from_slice(&0u32.to_be_bytes()); // mtime.sec
+            entry.extend_from_slice(&0u32.to_be_bytes()); // mtime.nsec
+            entry.extend_from_slice(&0u32.to_be_bytes()); // dev
+            entry.extend_from_slice(&0u32.to_be_bytes()); // ino
+            entry.extend_from_slice(&0x81A4u32.to_be_bytes()); // mode 100644
+            entry.extend_from_slice(&0u32.to_be_bytes()); // uid
+            entry.extend_from_slice(&0u32.to_be_bytes()); // gid
+            entry.extend_from_slice(&(size).to_be_bytes()); // size
+
+            entry.extend_from_slice(&hash.to_bytes());
+
+            let flags = (line.len() as u16) & 0xFFF;
+            entry.extend_from_slice(&flags.to_be_bytes());
+            entry.extend_from_slice(line.as_bytes());
+
+            let total_len = 62 + line.len();
+            let pad = 8 - (total_len % 8);
+            for _ in 0..pad {
+                entry.push(0);
+            }
+            index.extend_from_slice(&entry);
+        }
+
+        use sha1::{Sha1, Digest};
         let mut hasher = Sha1::new();
         hasher.update(&index);
-        let index_hash = hasher.finalize();
-        index.extend_from_slice(&index_hash);
+        let final_hash = hasher.finalize();
+        index.extend_from_slice(&final_hash);
 
-        let git_index_path = self.repo_path.join(".git").join("index");
-        let mut git_index_file = fs::OpenOptions::new().create(true).write(true).truncate(true).open(git_index_path)?;
-        git_index_file.write_all(&index)?;
-
+        let path = self.repo_path.join(".git").join("index");
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::write(path, index)?;
         Ok(())
     }
 
@@ -315,5 +357,43 @@ impl super::StateStore for GitDiskStateStore {
         }
         
         Ok(())
+    }
+
+    fn append_reflog(&mut self, name: &str, old_hash: Hash, new_hash: Hash, committer: &str, message: &str) -> io::Result<()> {
+        let path = self.repo_path.join(".git").join("logs").join(name);
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let now = std::time::SystemTime::now();
+        let timestamp = now.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        writeln!(file, "{} {} {} {} +0000\tWIP on master: {}", old_hash, new_hash, committer, timestamp, message)?;
+        Ok(())
+    }
+
+    fn pop_reflog(&mut self, name: &str) -> io::Result<Option<Hash>> {
+        let path = self.repo_path.join(".git").join("logs").join(name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(&path)?;
+        let mut lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        if lines.is_empty() {
+            return Ok(None);
+        }
+        let last_line = lines.pop().unwrap();
+        // The first 40 chars is old_hash
+        let old_hash_str = last_line.split_whitespace().next().unwrap_or("");
+        let old_hash = Hash::from_hex(old_hash_str).unwrap_or(Hash::zero());
+
+        if lines.is_empty() {
+            let _ = fs::remove_file(&path);
+        } else {
+            let new_content = lines.join("\n") + "\n";
+            fs::write(&path, new_content)?;
+        }
+
+        Ok(Some(old_hash))
     }
 }
